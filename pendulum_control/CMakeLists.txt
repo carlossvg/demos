@@ -19,6 +19,7 @@ if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
 endif()
 
 find_package(rclcpp REQUIRED)
+find_package(rclcpp_lifecycle REQUIRED)
 find_package(pendulum_msgs REQUIRED)
 find_package(rttest)
 find_package(tlsf_cpp)
@@ -35,6 +36,7 @@ add_executable(pendulum_demo
 ament_target_dependencies(pendulum_demo
   "pendulum_msgs"
   "rclcpp"
+  "rclcpp_lifecycle"
   "rttest"
   "tlsf_cpp")
 

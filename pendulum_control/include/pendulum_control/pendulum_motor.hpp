@@ -26,6 +26,10 @@
 #include <cmath>
 #include <memory>
 
+#include "rclcpp/strategies/message_pool_memory_strategy.hpp"
+#include "rclcpp_lifecycle/lifecycle_node.hpp"
+#include "rclcpp_lifecycle/lifecycle_publisher.hpp"
+
 #include "rttest/rttest.h"
 #include "rttest/utils.hpp"
 
@@ -62,7 +66,7 @@ struct PendulumState
 };
 
 /// Represents the physical state of the pendulum, the controlling motor, and the position sensor.
-class PendulumMotor
+class PendulumMotor : public rclcpp_lifecycle::LifecycleNode
 {
 public:
   /// Default constructor.
@@ -71,9 +75,31 @@ public:
    * \param[in] properties Physical properties of the pendulum.
    */
   PendulumMotor(std::chrono::nanoseconds period, PendulumProperties properties)
-  : publish_period_(period), properties_(properties),
+  : LifecycleNode("pendulum_motor"),
+    publish_period_(period), properties_(properties),
     physics_update_period_(std::chrono::nanoseconds(1000000)),
-    message_ready_(false), done_(false)
+    message_ready_(false), done_(false),
+    sensor_pub_{create_publisher<pendulum_msgs::msg::JointState>(
+        "pendulum_sensor", rclcpp::QoS(1).best_effort())},
+    command_sub_{create_subscription<pendulum_msgs::msg::JointCommand>(
+        "pendulum_command", rclcpp::QoS(1).best_effort(),
+        [this](pendulum_msgs::msg::JointCommand::ConstSharedPtr msg) -> void
+        {
+          on_command_message(msg);
+        },
+        rclcpp::SubscriptionOptions(),
+        std::make_shared<
+          rclcpp::strategies::message_pool_memory_strategy::MessagePoolMemoryStrategy<
+            pendulum_msgs::msg::JointCommand, 1>>())},
+    motor_publisher_timer_{
+    create_wall_timer(
+      period,
+      [this]() {
+        if (next_message_ready()) {
+          auto msg = get_next_sensor_message();
+          sensor_pub_->publish(msg);
+        }
+      })}
   {
     // Calculate physics engine timestep.
     dt_ = physics_update_period_.count() / (1000.0 * 1000.0 * 1000.0);
@@ -185,6 +211,38 @@ public:
   size_t messages_received = 0;
 
 private:
+  rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn
+  on_configure(const rclcpp_lifecycle::State &) override
+  {
+    return rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn::SUCCESS;
+  }
+
+  rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn
+  on_activate(const rclcpp_lifecycle::State &) override
+  {
+    sensor_pub_->on_activate();
+    return LifecycleNodeInterface::CallbackReturn::SUCCESS;
+  }
+
+  rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn
+  on_deactivate(const rclcpp_lifecycle::State &) override
+  {
+    sensor_pub_->on_deactivate();
+    return LifecycleNodeInterface::CallbackReturn::SUCCESS;
+  }
+
+  rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn
+  on_cleanup(const rclcpp_lifecycle::State &) override
+  {
+    return LifecycleNodeInterface::CallbackReturn::SUCCESS;
+  }
+
+  rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn
+  on_shutdown(const rclcpp_lifecycle::State &) override
+  {
+    return LifecycleNodeInterface::CallbackReturn::SUCCESS;
+  }
+
   static void * physics_update_wrapper(void * args)
   {
     PendulumMotor * motor = static_cast<PendulumMotor *>(args);
@@ -249,6 +307,11 @@ private:
 
   pthread_t physics_update_thread_;
   pthread_attr_t thread_attr_;
+
+  std::shared_ptr<rclcpp_lifecycle::LifecyclePublisher<pendulum_msgs::msg::JointState>>
+  sensor_pub_;
+  std::shared_ptr<rclcpp::Subscription<pendulum_msgs::msg::JointCommand>> command_sub_;
+  rclcpp::TimerBase::SharedPtr motor_publisher_timer_;
 };
 
 }  // namespace pendulum_control
