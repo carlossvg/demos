@@ -80,6 +80,10 @@ public:
     physics_update_period_(std::chrono::nanoseconds(1000000)),
     message_ready_(false), done_(false)
   {
+    // Create realtime callback group for critical excutables
+    realtime_callback_group_ = this->create_callback_group(
+      rclcpp::CallbackGroupType::MutuallyExclusive);
+
     // The quality of service profile is tuned for real-time performance.
     // More QoS settings may be exposed by the rmw interface in the future to fulfill real-time
     // requirements.
@@ -126,13 +130,20 @@ public:
       };
 
     // Add a timer to enable regular publication of sensor messages.
-    motor_publisher_timer_ = create_wall_timer(period, motor_publish_callback);
+    motor_publisher_timer_ = create_wall_timer(
+      period, motor_publish_callback,
+      realtime_callback_group_);
+    // cancel immediately to prevent it running the first time.
+    motor_publisher_timer_->cancel();
+
+    auto command_subscription_options = rclcpp::SubscriptionOptions();
+    command_subscription_options.callback_group = realtime_callback_group_;
 
     // Initialize the subscription to the command message.
     // Notice that we pass the MessagePoolMemoryStrategy<JointCommand> initialized above.
     command_sub_ = create_subscription<pendulum_msgs::msg::JointCommand>(
       "pendulum_command", qos, motor_subscribe_callback,
-      rclcpp::SubscriptionOptions(), command_msg_strategy);
+      command_subscription_options, command_msg_strategy);
 
     // Calculate physics engine timestep.
     dt_ = physics_update_period_.count() / (1000.0 * 1000.0 * 1000.0);
@@ -240,6 +251,13 @@ public:
     properties_ = properties;
   }
 
+  /// Get the real-time callback group.
+  // \return The callback group.
+  rclcpp::CallbackGroup::SharedPtr get_realtime_callback_group()
+  {
+    return realtime_callback_group_;
+  }
+
   /// Count the number of messages received (number of times the callback fired).
   size_t messages_received = 0;
 
@@ -254,12 +272,14 @@ private:
   on_activate(const rclcpp_lifecycle::State &) override
   {
     sensor_pub_->on_activate();
+    motor_publisher_timer_->reset();
     return LifecycleNodeInterface::CallbackReturn::SUCCESS;
   }
 
   rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn
   on_deactivate(const rclcpp_lifecycle::State &) override
   {
+    motor_publisher_timer_->cancel();
     sensor_pub_->on_deactivate();
     return LifecycleNodeInterface::CallbackReturn::SUCCESS;
   }
@@ -340,6 +360,8 @@ private:
 
   pthread_t physics_update_thread_;
   pthread_attr_t thread_attr_;
+
+  rclcpp::CallbackGroup::SharedPtr realtime_callback_group_;
 
   std::shared_ptr<rclcpp_lifecycle::LifecyclePublisher<pendulum_msgs::msg::JointState>>
   sensor_pub_;

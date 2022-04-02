@@ -70,7 +70,17 @@ int main(int argc, char * argv[])
   auto motor_node = std::make_shared<pendulum_control::PendulumMotor>(
     std::chrono::nanoseconds(970000), properties);
 
-  // Initialize the executor.
+  // Initialize the executor
+  rclcpp::executors::StaticSingleThreadedExecutor non_realtime_executor;
+
+  // Add the motor and controller nodes to the executor.
+  non_realtime_executor.add_callback_group(
+    motor_node->get_node_base_interface()->get_default_callback_group(),
+    motor_node->get_node_base_interface());
+  non_realtime_executor.add_callback_group(
+    controller_node->get_node_base_interface()->get_default_callback_group(),
+    controller_node->get_node_base_interface());
+
   rclcpp::ExecutorOptions options;
   // One of the arguments passed to the Executor is the memory strategy, which delegates the
   // runtime-execution allocations to the TLSF allocator.
@@ -79,17 +89,14 @@ int main(int argc, char * argv[])
   options.memory_strategy = memory_strategy;
   // RttExecutor is a special single-threaded executor instrumented to calculate and record
   // real-time performance statistics.
-  auto executor = std::make_shared<pendulum_control::RttExecutor>(options);
-
-  // Add the motor and controller nodes to the executor.
-  executor->add_node(motor_node->get_node_base_interface());
-  executor->add_node(controller_node->get_node_base_interface());
-
-  // Set the priority of this thread to the maximum safe value, and set its scheduling policy to a
-  // deterministic (real-time safe) algorithm, round robin.
-  if (rttest_set_sched_priority(98, SCHED_RR)) {
-    perror("Couldn't set scheduling priority and policy");
-  }
+  // auto realtime_executor = std::make_shared<pendulum_control::RttExecutor>(options);
+  auto realtime_executor = std::make_shared<rclcpp::executors::StaticSingleThreadedExecutor>(options);
+  realtime_executor->add_callback_group(
+    controller_node->get_realtime_callback_group(),
+    controller_node->get_node_base_interface());
+  realtime_executor->add_callback_group(
+    motor_node->get_realtime_callback_group(),
+    motor_node->get_node_base_interface());
 
   // Set node lifecycle states to configured
   if (lifecycle_msgs::msg::State::PRIMARY_STATE_INACTIVE != motor_node->configure().id()) {
@@ -98,6 +105,25 @@ int main(int argc, char * argv[])
   if (lifecycle_msgs::msg::State::PRIMARY_STATE_INACTIVE != controller_node->configure().id()) {
     throw std::runtime_error("Could not configure " + std::string(controller_node->get_name()));
   }
+
+  // spin normal executor in a normal thread
+  auto non_realtime_executor_thread = std::thread(
+    [&]() {
+      non_realtime_executor.spin();
+    });
+
+  // spin real-time executor in a thread with higher priority
+  auto realtime_executor_thread = std::thread(
+    [&]() {
+      // Set the priority of this thread to the maximum safe value, and set its scheduling policy to a
+      // deterministic (real-time safe) algorithm, round robin.
+      if (rttest_set_sched_priority(98, SCHED_RR)) {
+        perror("Couldn't set scheduling priority and policy");
+      }
+      // Unlike the default SingleThreadedExecutor::spin function, RttExecutor::spin runs in
+      // bounded time (for as many iterations as specified in the rttest parameters).
+      realtime_executor->spin();
+    });
 
   // Lock the currently cached virtual memory into RAM, as well as any future memory allocations,
   // and do our best to prefault the locked memory to prevent future pagefaults.
@@ -121,11 +147,14 @@ int main(int argc, char * argv[])
     throw std::runtime_error("Could not activate " + std::string(controller_node->get_name()));
   }
 
-  // Unlike the default SingleThreadedExecutor::spin function, RttExecutor::spin runs in
-  // bounded time (for as many iterations as specified in the rttest parameters).
-  executor->spin();
+  // TODO: add experiment stop conditions
+  std::this_thread::sleep_for(std::chrono::seconds(10));
+  realtime_executor->cancel();
+  realtime_executor_thread.join();
   // Once the executor has exited, notify the physics simulation to stop running.
   motor_node->set_done(true);
+  non_realtime_executor.cancel();
+  non_realtime_executor_thread.join();
 
   // End execution phase
 

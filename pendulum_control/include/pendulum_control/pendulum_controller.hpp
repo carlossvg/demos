@@ -63,6 +63,10 @@ public:
     publish_period_(period), pid_(pid),
     message_ready_(false)
   {
+    // Create realtime callback group for critical excutables
+    realtime_callback_group_ = this->create_callback_group(
+      rclcpp::CallbackGroupType::MutuallyExclusive);
+
     // The quality of service profile is tuned for real-time performance.
     // More QoS settings may be exposed by the rmw interface in the future to fulfill real-time
     // requirements.
@@ -116,11 +120,14 @@ public:
         }
       };
 
+    auto sensor_subscription_options = rclcpp::SubscriptionOptions();
+    sensor_subscription_options.callback_group = realtime_callback_group_;
+
     // Initialize the subscriber for the sensor message.
     // Notice that we pass the MessageMemoryPoolStrategy<JointState> initialized above.
     sensor_sub_ = this->create_subscription<pendulum_msgs::msg::JointState>(
       "pendulum_sensor", qos, controller_subscribe_callback,
-      rclcpp::SubscriptionOptions(), state_msg_strategy);
+      sensor_subscription_options, state_msg_strategy);
 
     // Receive the most recently published message from the teleop node publisher.
     auto qos_setpoint_sub = qos;
@@ -131,7 +138,11 @@ public:
       rclcpp::SubscriptionOptions(),
       setpoint_msg_strategy);
 
-    controller_publisher_timer_ = create_wall_timer(period, controller_publish_callback);
+    controller_publisher_timer_ = create_wall_timer(
+      period, controller_publish_callback,
+      realtime_callback_group_);
+    // cancel immediately to prevent it running the first time.
+    controller_publisher_timer_->cancel();
 
     command_message_.position = pid_.command;
     // Calculate the controller timestep (for discrete differentiation/integration).
@@ -233,6 +244,13 @@ public:
     return pid_.command;
   }
 
+  /// Get the real-time callback group.
+  // \return The callback group.
+  rclcpp::CallbackGroup::SharedPtr get_realtime_callback_group()
+  {
+    return realtime_callback_group_;
+  }
+
   /// Count the number of messages received (number of times the callback fired).
   size_t messages_received = 0;
 
@@ -246,6 +264,7 @@ private:
   rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn
   on_activate(const rclcpp_lifecycle::State &) override
   {
+    controller_publisher_timer_->reset();
     command_pub_->on_activate();
     return LifecycleNodeInterface::CallbackReturn::SUCCESS;
   }
@@ -253,6 +272,7 @@ private:
   rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn
   on_deactivate(const rclcpp_lifecycle::State &) override
   {
+    controller_publisher_timer_->cancel();
     command_pub_->on_deactivate();
     return LifecycleNodeInterface::CallbackReturn::SUCCESS;
   }
@@ -279,6 +299,8 @@ private:
   double last_error_ = 0;
   double i_gain_ = 0;
   double dt_;
+
+  rclcpp::CallbackGroup::SharedPtr realtime_callback_group_;
 
   std::shared_ptr<rclcpp_lifecycle::LifecyclePublisher<pendulum_msgs::msg::JointCommand>>
   command_pub_;
