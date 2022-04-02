@@ -78,29 +78,62 @@ public:
   : LifecycleNode("pendulum_motor"),
     publish_period_(period), properties_(properties),
     physics_update_period_(std::chrono::nanoseconds(1000000)),
-    message_ready_(false), done_(false),
-    sensor_pub_{create_publisher<pendulum_msgs::msg::JointState>(
-        "pendulum_sensor", rclcpp::QoS(1).best_effort())},
-    command_sub_{create_subscription<pendulum_msgs::msg::JointCommand>(
-        "pendulum_command", rclcpp::QoS(1).best_effort(),
-        [this](pendulum_msgs::msg::JointCommand::ConstSharedPtr msg) -> void
-        {
-          on_command_message(msg);
-        },
-        rclcpp::SubscriptionOptions(),
-        std::make_shared<
-          rclcpp::strategies::message_pool_memory_strategy::MessagePoolMemoryStrategy<
-            pendulum_msgs::msg::JointCommand, 1>>())},
-    motor_publisher_timer_{
-    create_wall_timer(
-      period,
-      [this]() {
+    message_ready_(false), done_(false)
+  {
+    // The quality of service profile is tuned for real-time performance.
+    // More QoS settings may be exposed by the rmw interface in the future to fulfill real-time
+    // requirements.
+    auto qos = rclcpp::QoS(
+      // The "KEEP_LAST" history setting tells DDS to store a fixed-size buffer of values before they
+      // are sent, to aid with recovery in the event of dropped messages.
+      // "depth" specifies the size of this buffer.
+      // In this example, we are optimizing for performance and limited resource usage (preventing
+      // page faults), instead of reliability. Thus, we set the size of the history buffer to 1.
+      rclcpp::KeepLast(1)
+    );
+    // From http://www.opendds.org/qosusages.html: "A RELIABLE setting can potentially block while
+    // trying to send." Therefore set the policy to best effort to avoid blocking during execution.
+    qos.best_effort();
+
+    // Initialize the publisher for the sensor message (the current position of the pendulum).
+    sensor_pub_ = create_publisher<pendulum_msgs::msg::JointState>(
+      "pendulum_sensor", qos);
+
+    // The MessagePoolMemoryStrategy preallocates a pool of messages to be used by the subscription.
+    // Typically, one MessagePoolMemoryStrategy is used per subscription type, and the size of the
+    // message pool is determined by the number of threads (the maximum number of concurrent accesses
+    // to the subscription).
+    // Since this example is single-threaded, we choose a message pool size of 1 for each strategy.
+    using rclcpp::strategies::message_pool_memory_strategy::MessagePoolMemoryStrategy;
+    auto state_msg_strategy =
+      std::make_shared<MessagePoolMemoryStrategy<pendulum_msgs::msg::JointState, 1>>();
+    auto command_msg_strategy =
+      std::make_shared<MessagePoolMemoryStrategy<pendulum_msgs::msg::JointCommand, 1>>();
+
+    // Create a lambda function to invoke the motor callback when a command is received.
+    auto motor_subscribe_callback =
+      [this](pendulum_msgs::msg::JointCommand::ConstSharedPtr msg) -> void
+      {
+        on_command_message(msg);
+      };
+
+    // Create a lambda function that will fire regularly to publish the next sensor message.
+    auto motor_publish_callback = [this]() {
         if (next_message_ready()) {
           auto msg = get_next_sensor_message();
           sensor_pub_->publish(msg);
         }
-      })}
-  {
+      };
+
+    // Add a timer to enable regular publication of sensor messages.
+    motor_publisher_timer_ = create_wall_timer(period, motor_publish_callback);
+
+    // Initialize the subscription to the command message.
+    // Notice that we pass the MessagePoolMemoryStrategy<JointCommand> initialized above.
+    command_sub_ = create_subscription<pendulum_msgs::msg::JointCommand>(
+      "pendulum_command", qos, motor_subscribe_callback,
+      rclcpp::SubscriptionOptions(), command_msg_strategy);
+
     // Calculate physics engine timestep.
     dt_ = physics_update_period_.count() / (1000.0 * 1000.0 * 1000.0);
     uint64_to_timespec(physics_update_period_.count(), &physics_update_timespec_);

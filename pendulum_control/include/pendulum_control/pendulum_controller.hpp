@@ -61,38 +61,78 @@ public:
   PendulumController(std::chrono::nanoseconds period, PIDProperties pid)
   : LifecycleNode("pendulum_controller"),
     publish_period_(period), pid_(pid),
-    message_ready_(false),
-    command_pub_{create_publisher<pendulum_msgs::msg::JointCommand>(
-        "pendulum_command", rclcpp::QoS(1).best_effort())},
-    sensor_sub_{
-      create_subscription<pendulum_msgs::msg::JointState>(
-        "pendulum_sensor", rclcpp::QoS(1).best_effort(), [this]
-          (pendulum_msgs::msg::JointState::ConstSharedPtr msg) -> void
-        {
-          on_sensor_message(msg);
-        }, rclcpp::SubscriptionOptions(),
-        std::make_shared<
-          rclcpp::strategies::message_pool_memory_strategy::MessagePoolMemoryStrategy<
-            pendulum_msgs::msg::JointState, 1>>())},
-    setpoint_sub_{create_subscription<pendulum_msgs::msg::JointCommand>(
-      "pendulum_setpoint", rclcpp::QoS(1).transient_local(), [this]
-        (pendulum_msgs::msg::JointCommand::ConstSharedPtr msg) -> void
+    message_ready_(false)
+  {
+    // The quality of service profile is tuned for real-time performance.
+    // More QoS settings may be exposed by the rmw interface in the future to fulfill real-time
+    // requirements.
+    auto qos = rclcpp::QoS(
+      // The "KEEP_LAST" history setting tells DDS to store a fixed-size buffer of values before they
+      // are sent, to aid with recovery in the event of dropped messages.
+      // "depth" specifies the size of this buffer.
+      // In this example, we are optimizing for performance and limited resource usage (preventing
+      // page faults), instead of reliability. Thus, we set the size of the history buffer to 1.
+      rclcpp::KeepLast(1)
+    );
+    // From http://www.opendds.org/qosusages.html: "A RELIABLE setting can potentially block while
+    // trying to send." Therefore set the policy to best effort to avoid blocking during execution.
+    qos.best_effort();
+
+    // Initialize the publisher for the command message.
+    command_pub_ = this->create_publisher<pendulum_msgs::msg::JointCommand>(
+      "pendulum_command", qos);
+
+    // The MessagePoolMemoryStrategy preallocates a pool of messages to be used by the subscription.
+    // Typically, one MessagePoolMemoryStrategy is used per subscription type, and the size of the
+    // message pool is determined by the number of threads (the maximum number of concurrent accesses
+    // to the subscription).
+    // Since this example is single-threaded, we choose a message pool size of 1 for each strategy.
+    using rclcpp::strategies::message_pool_memory_strategy::MessagePoolMemoryStrategy;
+    auto state_msg_strategy =
+      std::make_shared<MessagePoolMemoryStrategy<pendulum_msgs::msg::JointState, 1>>();
+    auto setpoint_msg_strategy =
+      std::make_shared<MessagePoolMemoryStrategy<pendulum_msgs::msg::JointCommand, 1>>();
+
+    // Create a lambda function to invoke the controller callback when a command is received.
+    auto controller_subscribe_callback =
+      [this](pendulum_msgs::msg::JointState::ConstSharedPtr msg) -> void
       {
-        on_pendulum_setpoint(msg);
-      },
-      rclcpp::SubscriptionOptions(),
-      std::make_shared<
-        rclcpp::strategies::message_pool_memory_strategy::MessagePoolMemoryStrategy<
-          pendulum_msgs::msg::JointCommand, 1>>())},
-  controller_publisher_timer_{create_wall_timer(
-      period, [this]()
+        this->on_sensor_message(msg);
+      };
+
+    // Create a lambda function to accept user input to command the pendulum
+    auto controller_command_callback =
+      [this](pendulum_msgs::msg::JointCommand::ConstSharedPtr msg) -> void
+      {
+        this->on_pendulum_setpoint(msg);
+      };
+
+    // Create a lambda function to accept user input to command the pendulum
+    auto controller_publish_callback = [this]()
       {
         if (next_message_ready()) {
           auto msg = get_next_command_message();
           command_pub_->publish(msg);
         }
-      })}
-  {
+      };
+
+    // Initialize the subscriber for the sensor message.
+    // Notice that we pass the MessageMemoryPoolStrategy<JointState> initialized above.
+    sensor_sub_ = this->create_subscription<pendulum_msgs::msg::JointState>(
+      "pendulum_sensor", qos, controller_subscribe_callback,
+      rclcpp::SubscriptionOptions(), state_msg_strategy);
+
+    // Receive the most recently published message from the teleop node publisher.
+    auto qos_setpoint_sub = qos;
+    qos_setpoint_sub.transient_local();
+
+    setpoint_sub_ = create_subscription<pendulum_msgs::msg::JointCommand>(
+      "pendulum_setpoint", qos_setpoint_sub, controller_command_callback,
+      rclcpp::SubscriptionOptions(),
+      setpoint_msg_strategy);
+
+    controller_publisher_timer_ = create_wall_timer(period, controller_publish_callback);
+
     command_message_.position = pid_.command;
     // Calculate the controller timestep (for discrete differentiation/integration).
     dt_ = publish_period_.count() / (1000.0 * 1000.0 * 1000.0);
